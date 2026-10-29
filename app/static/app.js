@@ -17,7 +17,20 @@ function md(s) {
   return t;
 }
 async function api(url, options={}) {
-  const res = await fetch(url, {credentials:"same-origin", ...options, headers: {...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}), ...(options.headers||{})}});
+  const method = (options.method || "GET").toUpperCase();
+  const headers = {
+    ...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}),
+    ...(options.headers || {})
+  };
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const token = document.querySelector('meta[name="csrf-token"]')?.content;
+    if (token) headers["X-CSRF-Token"] = token;
+  }
+  const res = await fetch(url, {
+    credentials:"same-origin",
+    ...options,
+    headers
+  });
   if (res.status === 401) { location.href="/login"; throw new Error("Please sign in again"); }
   const body = await res.json().catch(()=>({}));
   if (!res.ok) throw new Error(body.detail || "Something went wrong");

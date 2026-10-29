@@ -1,4 +1,5 @@
-import os, re, sqlite3, secrets, json, pathlib, mimetypes
+import os, re, sqlite3, secrets, json, pathlib, mimetypes, base64, time
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from typing import Optional
 import httpx
@@ -13,12 +14,76 @@ DB_PATH = os.getenv("DATABASE_PATH", "/data/app.db")
 UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "/data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SECRET_KEY = os.getenv("SECRET_KEY", "unsafe-development-secret-change-me")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeThisNow-123!")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/")
-pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+login_attempts = {}
+# Master key for encryption of secrets
+MASTER_KEY = os.getenv("MASTER_KEY")
+
+def get_fernet():
+    if not MASTER_KEY:
+        return None
+    # Ensure key is 32 url-safe base64-encoded bytes
+    return Fernet(MASTER_KEY)
+
+def encrypt_value(plaintext: str) -> str:
+    f = get_fernet()
+    if f:
+        return f.encrypt(plaintext.encode()).decode()
+    return plaintext
+
+def decrypt_value(ciphertext: str) -> str:
+    f = get_fernet()
+    if f:
+        try:
+            return f.decrypt(ciphertext.encode()).decode()
+        except InvalidToken:
+            return ciphertext
+    return ciphertext
+
 app = FastAPI(title=APP_NAME)
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=False)
+
+@app.middleware("http")
+async def csrf_protect(request: Request, call_next):
+    unsafe_methods = {"POST", "PUT", "PATCH", "DELETE"}
+
+    # Let unauthenticated API requests reach their normal authentication
+    # checks so they retain the expected 401 response.
+    # The login form is validated separately below.
+    if (
+        request.method in unsafe_methods
+        and request.url.path != "/login"
+        and request.session.get("uid")
+    ):
+        expected = request.session.get("csrf_token", "")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "CSRF token missing or invalid"},
+            )
+
+    return await call_next(request)
+
+# SessionMiddleware must wrap the CSRF middleware so request.session
+# is available during CSRF validation.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    same_site="strict",
+    https_only=COOKIE_SECURE,
+    httponly=True
+)
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+    return response
+
 templates = Jinja2Templates(directory="app/templates")
 
 def now():
@@ -63,6 +128,10 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
           filename TEXT NOT NULL, stored_name TEXT NOT NULL, extracted_text TEXT NOT NULL,
           created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS audit_log(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER, action TEXT, outcome TEXT, detail TEXT, created_at TEXT,
+          FOREIGN KEY(actor_id) REFERENCES users(id) ON DELETE SET NULL
+        );
         """)
         existing = c.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,)).fetchone()
         if not existing:
@@ -71,7 +140,11 @@ def init_db():
             uid = c.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,)).fetchone()["id"]
             c.execute("INSERT OR IGNORE INTO settings(user_id) VALUES(?)", (uid,))
 
-@app.on_event("startup")
+def log_event(actor_id: Optional[int], action: str, outcome: str, detail: str = ""):
+    with db() as c:
+        c.execute("INSERT INTO audit_log(actor_id, action, outcome, detail, created_at) VALUES(?,?,?,?,?)",
+                  (actor_id, action, outcome, detail, now()))
+
 def startup():
     init_db()
 
@@ -93,7 +166,17 @@ def require_user(request: Request):
     return u
 
 def page(request, name, **kwargs):
-    return templates.TemplateResponse(request=request, name=name, context={"request": request, "app_name": APP_NAME, **kwargs})
+    csrf_token = request.session.setdefault("csrf_token", secrets.token_urlsafe(32))
+    return templates.TemplateResponse(
+        request=request,
+        name=name,
+        context={
+            "request": request,
+            "app_name": APP_NAME,
+            "csrf_token": csrf_token,
+            **kwargs,
+        },
+    )
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
@@ -109,18 +192,45 @@ def login_page(request: Request):
     return page(request, "login.html", error=None)
 
 @app.post("/login")
-def login(request: Request, username: str = Form(...), password: str = Form(...)):
+def login(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    csrf_token: str = Form(""),
+):
+    expected = request.session.get("csrf_token", "")
+    if not expected or not csrf_token or not secrets.compare_digest(expected, csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
+    ip = request.client.host
+    attempt = login_attempts.get(ip, {"count":0, "first":0})
+    if attempt["count"] >=5 and time.time() - attempt["first"] < 900:
+        raise HTTPException(429, "Too many login attempts. Try again later.")
     with db() as c:
         u = c.execute("SELECT * FROM users WHERE username=?", (username.strip(),)).fetchone()
     if not u or not u["active"] or not pwd.verify(password, u["password_hash"]):
+        # Record failure
+        attempt["count"] += 1
+        if attempt["first"] == 0:
+            attempt["first"] = time.time()
+        login_attempts[ip] = attempt
+        log_event(None, "login", "failure", "Invalid credentials")
         return page(request, "login.html", error="Invalid username or password")
+    # Successful login
+    login_attempts.pop(ip, None)
+    log_event(u["id"], "login", "success")
     request.session.clear()
     request.session["uid"] = u["id"]
+    request.session["csrf_token"] = secrets.token_urlsafe(32)
     return RedirectResponse("/", status_code=303)
 
 @app.post("/logout")
-def logout(request: Request):
+def logout(request: Request, csrf_token: str = Form("")):
+    expected = request.session.get("csrf_token", "")
+    if not expected or not csrf_token or not secrets.compare_digest(expected, csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
     request.session.clear()
+    log_event(u["id"], "logout", "success")
     return RedirectResponse("/login", status_code=303)
 
 @app.get("/api/me")
@@ -233,9 +343,10 @@ async def put_settings(request: Request):
     with db() as c:
         old = c.execute("SELECT api_key FROM settings WHERE user_id=?", (u["id"],)).fetchone()
         if api_key is None: api_key = old["api_key"] if old else ""
+        api_key_encrypted = encrypt_value(api_key)
         c.execute("""INSERT INTO settings(user_id,provider,model,api_base,api_key) VALUES(?,?,?,?,?)
           ON CONFLICT(user_id) DO UPDATE SET provider=excluded.provider,model=excluded.model,api_base=excluded.api_base,api_key=excluded.api_key""",
-          (u["id"], provider, model, api_base, api_key))
+          (u["id"], provider, model, api_base, api_key_encrypted))
     return {"ok": True}
 
 @app.get("/api/notes")
@@ -299,6 +410,9 @@ async def upload_document(request: Request, file: UploadFile = File(...)):
     if suffix not in allowed: raise HTTPException(400, "Quick build supports TXT, MD, CSV, JSON and LOG files")
     data = await file.read(5 * 1024 * 1024 + 1)
     if len(data) > 5 * 1024 * 1024: raise HTTPException(413, "File limit is 5 MB")
+    guess = mimetypes.guess_type(name)[0]
+    if guess and file.content_type and not file.content_type.startswith('text/') and file.content_type != guess:
+        raise HTTPException(400, "File MIME type mismatch")
     text = data.decode("utf-8", errors="replace")
     stored = secrets.token_hex(16) + suffix
     (UPLOAD_DIR / stored).write_bytes(data)
