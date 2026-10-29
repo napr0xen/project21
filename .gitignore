@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+data/
+# SQLite databases and related files
+*.db
+*.db-wal
+*.db-shm
+# Docker build cache
+.dockerignore
+
+.DS_Store

@@ -1,0 +1,12 @@
+services:
+  crisis-management-rta:
+    build: .
+    container_name: crisis-management-rta
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - crisis_data:/data
+    restart: unless-stopped
+volumes:
+  crisis_data:
