@@ -1,4 +1,5 @@
 import os, re, sqlite3, secrets, json, pathlib, mimetypes, base64, time
+
 from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from typing import Optional
@@ -8,6 +9,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from passlib.context import CryptContext
+
+pwd = CryptContext(schemes=["argon2"], deprecated="auto")
+
+
 
 APP_NAME = os.getenv("APP_NAME", "Crisis Management RTA")
 DB_PATH = os.getenv("DATABASE_PATH", "/data/app.db")
@@ -29,18 +34,34 @@ def get_fernet():
     return Fernet(MASTER_KEY)
 
 def encrypt_value(plaintext: str) -> str:
+    if not plaintext:
+        return ""
+
     f = get_fernet()
-    if f:
-        return f.encrypt(plaintext.encode()).decode()
-    return plaintext
+    if not f:
+        raise RuntimeError("MASTER_KEY is required to store API keys securely")
+
+    return f.encrypt(plaintext.encode()).decode()
+
 
 def decrypt_value(ciphertext: str) -> str:
+    if not ciphertext:
+        return ""
+
     f = get_fernet()
-    if f:
+
+    # Support legacy plaintext keys, but never silently treat an
+    # encrypted value as plaintext when the encryption key is missing.
+    if ciphertext.startswith("gAAAA"):
+        if not f:
+            raise RuntimeError("MASTER_KEY is required to decrypt stored API keys")
+
         try:
             return f.decrypt(ciphertext.encode()).decode()
-        except InvalidToken:
-            return ciphertext
+        except InvalidToken as exc:
+            raise RuntimeError("Unable to decrypt the stored API key") from exc
+
+    # Backward compatibility for API keys saved before encryption.
     return ciphertext
 
 app = FastAPI(title=APP_NAME)
@@ -74,7 +95,6 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="strict",
     https_only=COOKIE_SECURE,
-    httponly=True
 )
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -90,13 +110,13 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 def db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(os.getenv("DATABASE_PATH", "/data/app.db"))
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     return con
 
 def init_db():
-    pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(os.getenv("DATABASE_PATH", "/data/app.db")).parent.mkdir(parents=True, exist_ok=True)
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
@@ -225,12 +245,28 @@ def login(
     return RedirectResponse("/", status_code=303)
 
 @app.post("/logout")
-def logout(request: Request, csrf_token: str = Form("")):
+def logout(request: Request):
+    uid = request.session.get("uid")
+
+    if not uid:
+        raise HTTPException(status_code=403, detail="Not authenticated")
+
     expected = request.session.get("csrf_token", "")
-    if not expected or not csrf_token or not secrets.compare_digest(expected, csrf_token):
-        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+    supplied = request.headers.get("X-CSRF-Token", "")
+
+    if (
+        not expected
+        or not supplied
+        or not secrets.compare_digest(expected, supplied)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="CSRF token missing or invalid"
+        )
+
     request.session.clear()
-    log_event(u["id"], "logout", "success")
+    log_event(uid, "logout", "success")
+
     return RedirectResponse("/login", status_code=303)
 
 @app.get("/api/me")
@@ -305,7 +341,7 @@ async def send_message(request: Request, chat_id: int):
         provider = data.get("provider") or (setting["provider"] if setting else "ollama") or chat["provider"]
         model = data.get("model") or (setting["model"] if setting else chat["model"])
         api_base = setting["api_base"] if setting else ""
-        api_key = setting["api_key"] if setting else ""
+        api_key = decrypt_value(setting["api_key"]) if setting else ""
         c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)", (chat_id, "user", content, now()))
         history = c.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 24", (chat_id,)).fetchall()
         c.execute("UPDATE chats SET updated_at=?,provider=?,model=? WHERE id=?", (now(), provider, model, chat_id))
@@ -340,10 +376,21 @@ async def put_settings(request: Request):
     model = str(data.get("model", "qwen3.5:9b"))[:160]
     api_base = str(data.get("api_base", ""))[:500]
     api_key = data.get("api_key")
+
     with db() as c:
-        old = c.execute("SELECT api_key FROM settings WHERE user_id=?", (u["id"],)).fetchone()
-        if api_key is None: api_key = old["api_key"] if old else ""
-        api_key_encrypted = encrypt_value(api_key)
+        old = c.execute(
+            "SELECT api_key FROM settings WHERE user_id=?",
+            (u["id"],)
+        ).fetchone()
+
+        if api_key is None:
+            # Preserve the existing value without encrypting it again.
+            api_key_encrypted = old["api_key"] if old else ""
+        else:
+            if not isinstance(api_key, str):
+                raise HTTPException(400, "Invalid API key")
+
+            api_key_encrypted = encrypt_value(api_key.strip())
         c.execute("""INSERT INTO settings(user_id,provider,model,api_base,api_key) VALUES(?,?,?,?,?)
           ON CONFLICT(user_id) DO UPDATE SET provider=excluded.provider,model=excluded.model,api_base=excluded.api_base,api_key=excluded.api_key""",
           (u["id"], provider, model, api_base, api_key_encrypted))

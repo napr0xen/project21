@@ -144,3 +144,41 @@ async function init(){
  document.addEventListener("keydown",e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){e.preventDefault();newChat();}});
 }
 init().catch(e=>{console.error(e);toast(e.message||"Could not start app");});
+document.addEventListener("DOMContentLoaded", () => {
+    const logoutForm = document.getElementById("logoutForm");
+
+    if (!logoutForm) return;
+
+    logoutForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+
+        const csrfToken = document.querySelector(
+            'meta[name="csrf-token"]'
+        )?.content;
+
+        if (!csrfToken) {
+            alert("Security token missing. Please refresh the page.");
+            return;
+        }
+
+        try {
+            const response = await fetch("/logout", {
+                method: "POST",
+                headers: {
+                    "X-CSRF-Token": csrfToken
+                }
+            });
+
+            if (response.redirected) {
+                window.location.href = response.url;
+            } else if (response.ok) {
+                window.location.href = "/login";
+            } else {
+                alert("Logout failed. Please refresh and try again.");
+            }
+        } catch (error) {
+            console.error("Logout error:", error);
+            alert("Unable to log out. Please try again.");
+        }
+    });
+});
